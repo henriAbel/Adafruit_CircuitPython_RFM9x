@@ -22,16 +22,23 @@
 """
 `adafruit_rfm9x`
 ====================================================
-
 CircuitPython module for the RFM95/6/7/8 LoRa 433/915mhz radio modules.  This is
 adapted from the Radiohead library RF95 code from:
 http: www.airspayce.com/mikem/arduino/RadioHead/
-
 * Author(s): Tony DiCola, Jerry Needell
 """
 import time
 import digitalio
+import pigpio # http://abyz.co.uk/rpi/pigpio/python.html
+import queue
+from datetime import datetime
 from micropython import const
+import binascii
+
+pi = pigpio.pi()
+if not pi.connected:
+    print("Not connected")
+    exit()
 
 try:
     from warnings import warn
@@ -225,6 +232,7 @@ _RH_RF95_FSTEP = (_RH_RF95_FXOSC / 524288)
 
 # RadioHead specific compatibility constants.
 _RH_BROADCAST_ADDRESS = const(0xFF)
+_RH_FLAGS_ACK         = const(0x80)
 
 # User facing constants:
 SLEEP_MODE   = 0b000
@@ -346,13 +354,18 @@ class RFM9x:
 
     bw_bins = (7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000)
 
-    def __init__(self, spi, cs, reset, frequency, *, preamble_length=8,
-                 high_power=True, baudrate=5000000):
+    def __init__(self, reset, interrupt, frequency, *, preamble_length=8,
+                 high_power=True, baudrate=5000000, channel=1):
+
+        # Get BCM pin number
+        int_pin = interrupt._pin.id
+        pi.set_mode(int_pin, pigpio.INPUT)
+        pi.set_pull_up_down(int_pin, pigpio.PUD_DOWN)
+        pi.callback(int_pin, pigpio.RISING_EDGE, self._handle_interrupt)
+        self.spi = pi.spi_open(channel, baudrate)
+
         self.high_power = high_power
-        # Device support SPI mode 0 (polarity & phase = 0) up to a max of 10mhz.
-        # Set Default Baudrate to 5MHz to avoid problems
-        self._device = spidev.SPIDevice(spi, cs, baudrate=baudrate,
-                                        polarity=0, phase=0)
+
         # Setup reset as a digital input (default state for reset line according
         # to the datasheet).  This line is pulled low as an output quickly to
         # trigger a reset.  Note that reset MUST be done like this and set as
@@ -395,6 +408,29 @@ class RFM9x:
         self.frequency_mhz = frequency
         # Set TX power to low defaut, 13 dB.
         self.tx_power = 13
+        self.packet_queue = queue.Queue()
+        self.receive_filter_address = _RH_BROADCAST_ADDRESS
+
+    def _handle_interrupt(self, gpio, level=0, tick=0):
+        if self.tx_done:
+            # FIXME not used yet
+            print("TX_DONE interrupt")
+            return
+        if self.rx_done and self.operation_mode == RX_MODE:
+            packet = self.receive_packet()
+            if packet is not None:
+                self.packet_queue.put(packet)
+
+    def _spi_read(self, register, length=1):
+        if length == 1:
+            (count, rx_data) = pi.spi_xfer(self.spi, [register] + [0] * length)
+            return rx_data[1]
+        else:
+            (count, rx_data) =  pi.spi_xfer(self.spi, [register] + [0] * length)
+            return rx_data[1:]
+
+    def spi_close(self):
+        pi.spi_close(self.spi)
 
     # pylint: disable=no-member
     # Reconsider pylint: disable when this can be tested
@@ -402,18 +438,11 @@ class RFM9x:
         # Read a number of bytes from the specified address into the provided
         # buffer.  If length is not specified (the default) the entire buffer
         # will be filled.
-        if length is None:
-            length = len(buf)
-        with self._device as device:
-            self._BUFFER[0] = address & 0x7F  # Strip out top bit to set 0
-                                              # value (read).
-            device.write(self._BUFFER, end=1)
-            device.readinto(buf, end=length)
+        packet = self._spi_read(address, len(buf) if length is None else length)
+        buf[0:] = packet
 
     def _read_u8(self, address):
-        # Read a single byte from the provided address and return it.
-        self._read_into(address, self._BUFFER, length=1)
-        return self._BUFFER[0]
+        return int(self._spi_read(address))
 
     def _write_from(self, address, buf, length=None):
         # Write a number of bytes to the provided address and taken from the
@@ -427,14 +456,17 @@ class RFM9x:
             device.write(self._BUFFER, end=1)
             device.write(buf, end=length)
 
-    def _write_u8(self, address, val):
+    def _write_u8(self, register, payload):
         # Write a byte register to the chip.  Specify the 7-bit address and the
         # 8-bit value to write to that address.
-        with self._device as device:
-            self._BUFFER[0] = (address | 0x80) & 0xFF  # Set top bit to 1 to
-                                                       # indicate a write.
-            self._BUFFER[1] = val & 0xFF
-            device.write(self._BUFFER, end=2)
+        if type(payload) == int:
+            payload = [payload]
+        elif type(payload) == bytes:
+            payload = [p for p in payload]
+        elif type(payload) == str:
+            payload = [ord(s) for s in payload]
+
+        pi.spi_xfer(self.spi, [register | 0x80] + payload)
 
     def reset(self):
         """Perform a reset of the chip."""
@@ -693,70 +725,34 @@ class RFM9x:
             raise RuntimeError('Timeout during packet send')
 
 
-
-    def receive(self, timeout=0.5, keep_listening=True, with_header=False,
-                rx_filter=_RH_BROADCAST_ADDRESS):
-        """Wait to receive a packet from the receiver. Will wait for up to timeout_s amount of
-           seconds for a packet to be received and decoded. If a packet is found the payload bytes
-           are returned, otherwise None is returned (which indicates the timeout elapsed with no
-           reception).
-           If keep_listening is True (the default) the chip will immediately enter listening mode
-           after reception of a packet, otherwise it will fall back to idle mode and ignore any
-           future reception.
-           A 4-byte header must be prepended to the data for compatibilty with the
-           RadioHead library.
-           The header consists of a 4 bytes (To,From,ID,Flags). The default setting will accept
-           any  incomming packet and strip the header before returning the packet to the caller.
-           If with_header is True then the 4 byte header will be returned with the packet.
-           The payload then begins at packet[4].
-           rx_fliter may be set to reject any "non-broadcast" packets that do not contain the
-           specfied "To" value in the header.
-           if rx_filter is set to 0xff (_RH_BROADCAST_ADDRESS) or if the  "To" field (packet[[0])
-           is equal to 0xff then the packet will be accepted and returned to the caller.
-           If rx_filter is not 0xff and packet[0] does not match rx_filter then
-           the packet is ignored and None is returned.
-        """
-        # Make sure we are listening for packets.
-        self.listen()
-        # Wait for the rx done interrupt.  This is not ideal and will
-        # surely miss or overflow the FIFO when packets aren't read fast
-        # enough, however it's the best that can be done from Python without
-        # interrupt supports.
-        start = time.monotonic()
-        timed_out = False
-        while not timed_out and not self.rx_done:
-            if (time.monotonic() - start) >= timeout:
-                timed_out = True
-        # Payload ready is set, a packet is in the FIFO.
-        packet = None
-        if not timed_out:
+    def receive_packet(self, with_header=True):
+        irq_flags = self._read_u8(_RH_RF95_REG_12_IRQ_FLAGS)
+        if self.operation_mode == _RH_RF95_MODE_RXCONTINUOUS and (irq_flags & _RH_RF95_RX_DONE):
             if self.enable_crc and self.crc_error:
+                self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xff)
                 warn("CRC error, packet ignored")
-            else:
-                # Grab the length of the received packet and check it has at least 5
-                # bytes to indicate the 4 byte header and at least 1 byte of user data.
-                length = self._read_u8(_RH_RF95_REG_13_RX_NB_BYTES)
-                if length < 5:
-                    packet = None
-                else:
-                    # Have a good packet, grab it from the FIFO.
-                    # Reset the fifo read ptr to the beginning of the packet.
-                    current_addr = self._read_u8(_RH_RF95_REG_10_FIFO_RX_CURRENT_ADDR)
-                    self._write_u8(_RH_RF95_REG_0D_FIFO_ADDR_PTR, current_addr)
-                    packet = bytearray(length)
-                    # Read the packet.
-                    self._read_into(_RH_RF95_REG_00_FIFO, packet)
-                    if (rx_filter != _RH_BROADCAST_ADDRESS and packet[0] != _RH_BROADCAST_ADDRESS
-                            and packet[0] != rx_filter):
-                        packet = None
-                    elif not with_header:  # skip the header if not wanted
-                        packet = packet[4:]
-        # Listen again if necessary and return the result packet.
-        if keep_listening:
+                return
+
+            packet_len = self._read_u8(_RH_RF95_REG_13_RX_NB_BYTES)
+            current_addr = self._read_u8(_RH_RF95_REG_10_FIFO_RX_CURRENT_ADDR)
+            self._write_u8(_RH_RF95_REG_0D_FIFO_ADDR_PTR, current_addr)
+            packet = bytearray(packet_len)
+            self._read_into(_RH_RF95_REG_00_FIFO, packet)
+            self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xff)
+            if with_header and packet_len >= 4:
+                header_to = packet[0]
+                header_from = packet[1]
+                header_id = packet[2]
+                header_flags = packet[3]
+
+                # If filter is defined and this message does not match
+                if self.receive_filter_address is not None and header_to != self.receive_filter_address and header_to != _RH_BROADCAST_ADDRESS:
+                    self.listen()
+                    return
+
+                # FIXME add Radiohead ACK support
+                print("Got packet from {} to {} id {} flags {} data: {}".format(header_from, header_to, header_id, header_flags, binascii.hexlify(packet[4:]) if header_flags != 128 else packet[4:].decode("utf-8")))
+                packet = packet[4:]
+
             self.listen()
-        else:
-        # Enter idle mode to stop receiving other packets.
-            self.idle()
-        # Clear interrupt.
-        self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
-        return packet
+            return packet

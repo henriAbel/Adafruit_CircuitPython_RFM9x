@@ -14,6 +14,7 @@ RADIO_FREQ_MHZ = 915.0  # Frequency of the radio in Mhz. Must match your
 # Define pins connected to the chip, use these if wiring up the breakout according to the guide:
 CS = digitalio.DigitalInOut(board.D5)
 RESET = digitalio.DigitalInOut(board.D6)
+INT = digitalio.DigitalInOut(board.D24)
 # Or uncomment and instead use these if using a Feather M0 RFM9x board and the appropriate
 # CircuitPython build:
 # CS = digitalio.DigitalInOut(board.RFM9X_CS)
@@ -23,11 +24,9 @@ RESET = digitalio.DigitalInOut(board.D6)
 LED = digitalio.DigitalInOut(board.D13)
 LED.direction = digitalio.Direction.OUTPUT
 
-# Initialize SPI bus.
-spi = busio.SPI(board.SCK, MOSI=board.MOSI, MISO=board.MISO)
-
 # Initialze RFM radio
-rfm9x = adafruit_rfm9x.RFM9x(spi, CS, RESET, RADIO_FREQ_MHZ)
+# Assume that CS is connected to channel 1, pin 7
+rfm9x = adafruit_rfm9x.RFM9x(RESET, INT, RADIO_FREQ_MHZ)
 
 # Note that the radio is configured in LoRa mode so you can't control sync
 # word, encryption, frequency deviation, or other settings!
@@ -50,8 +49,8 @@ print('Sent Hello World message!')
 print('Waiting for packets...')
 
 while True:
-    packet = rfm9x.receive()
-    # Optionally change the receive timeout from its default of 0.5 seconds:
+    packet = rfm9x.packet_queue.get(timeout=.5)
+    # You change the receive timeout from its default of 0.5 seconds:
     #packet = rfm9x.receive(timeout=5.0)
     # If no packet was received during the timeout then None is returned.
     if packet is None:
