@@ -33,6 +33,7 @@ import pigpio # http://abyz.co.uk/rpi/pigpio/python.html
 import queue
 from datetime import datetime
 from micropython import const
+from collections import namedtuple
 import binascii
 import struct
 
@@ -241,6 +242,7 @@ FS_RX_MODE   = 0b100
 RX_MODE      = 0b101
 # pylint: enable=bad-whitespace
 
+FLAGS_ACK = 0x80
 
 # Disable the too many instance members warning.  Pylint has no knowledge
 # of the context and is merely guessing at the proper amount of members.  This
@@ -409,6 +411,7 @@ class RFM9x:
         self.packet_queue = queue.Queue()
         self.receive_filter_address = _RH_BROADCAST_ADDRESS
         self.acks = False
+        self.debug = False
 
     def _handle_interrupt(self, gpio, level=0, tick=0):
         if self.tx_done:
@@ -484,7 +487,7 @@ class RFM9x:
         transmitting a packet of data use :py:func:`send` instead.
         """
         self.operation_mode = TX_MODE
-        self.dio0_mapping = 0b01  # Interrupt on tx done.
+        self._write_u8(_RH_RF95_REG_40_DIO_MAPPING1, 0x40) # Interrupt on tx done.
 
     @property
     def preamble_length(self):
@@ -570,6 +573,10 @@ class RFM9x:
         # Read RSSI register and convert to value using formula in datasheet.
         # Remember in LoRa mode the payload register changes function to RSSI!
         return self._read_u8(_RH_RF95_REG_1A_PKT_RSSI_VALUE) - 137
+
+    @property
+    def snr(self):
+        return self._read_u8(_RH_RF95_REG_19_PKT_SNR_VALUE) / 4
 
     @property
     def signal_bandwidth(self):
@@ -717,7 +724,7 @@ class RFM9x:
         if self.operation_mode == _RH_RF95_MODE_RXCONTINUOUS and (irq_flags & _RH_RF95_RX_DONE):
             if self.enable_crc and self.crc_error:
                 self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xff)
-                warn("CRC error, packet ignored")
+                warn('CRC error, packet ignored')
                 return
 
             packet_len = self._read_u8(_RH_RF95_REG_13_RX_NB_BYTES)
@@ -725,20 +732,22 @@ class RFM9x:
             self._write_u8(_RH_RF95_REG_0D_FIFO_ADDR_PTR, current_addr)
             packet = bytearray(packet_len)
             self._read_into(_RH_RF95_REG_00_FIFO, packet)
+            rssi = self.rssi
+            snr = self.snr
             self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xff)
             if with_header and packet_len >= 4:
                 header_to = packet[0]
                 header_from = packet[1]
                 header_id = packet[2]
                 header_flags = packet[3]
-                FLAGS_ACK = 0x80
 
                 # If filter is defined and this message does not match
                 if self.receive_filter_address is not None and header_to != self.receive_filter_address:
                     self.listen()
                     return
 
-                print("Got packet from {} to {} id {} flags {} data: {}".format(header_from, header_to, header_id, header_flags, binascii.hexlify(packet[4:]) if header_flags != 128 else packet[4:].decode("utf-8")))
+                if self.debug:
+                    print('Got packet from {} to {} id {} flags {} rssi {} snr {} data: {}'.format(header_from, header_to, header_id, header_flags, rssi, snr, binascii.hexlify(packet[4:]) if header_flags != 128 else packet[4:].decode("utf-8")))
 
                 if self.acks and not header_flags & FLAGS_ACK:
                     self.send(b'!', tx_header=[header_from, self.receive_filter_address, header_id, FLAGS_ACK])
@@ -746,4 +755,4 @@ class RFM9x:
                 packet = packet[4:]
 
             self.listen()
-            return packet
+            return namedtuple('Packet', ['data', 'rssi', 'snr'])(packet, rssi, snr)
