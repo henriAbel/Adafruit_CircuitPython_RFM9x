@@ -34,6 +34,7 @@ import queue
 from datetime import datetime
 from micropython import const
 import binascii
+import struct
 
 pi = pigpio.pi()
 if not pi.connected:
@@ -46,8 +47,6 @@ except ImportError:
     def warn(msg, **kwargs):
         "Issue a warning to stdout."
         print("%s: %s" % ("Warning" if kwargs.get("cat") is None else kwargs["cat"].__name__, msg))
-
-import adafruit_bus_device.spi_device as spidev
 
 
 __version__ = "0.0.0-auto.0"
@@ -232,7 +231,6 @@ _RH_RF95_FSTEP = (_RH_RF95_FXOSC / 524288)
 
 # RadioHead specific compatibility constants.
 _RH_BROADCAST_ADDRESS = const(0xFF)
-_RH_FLAGS_ACK         = const(0x80)
 
 # User facing constants:
 SLEEP_MODE   = 0b000
@@ -410,6 +408,7 @@ class RFM9x:
         self.tx_power = 13
         self.packet_queue = queue.Queue()
         self.receive_filter_address = _RH_BROADCAST_ADDRESS
+        self.acks = False
 
     def _handle_interrupt(self, gpio, level=0, tick=0):
         if self.tx_done:
@@ -441,24 +440,12 @@ class RFM9x:
         packet = self._spi_read(address, len(buf) if length is None else length)
         buf[0:] = packet
 
+    # TODO rename
     def _read_u8(self, address):
         return int(self._spi_read(address))
 
-    def _write_from(self, address, buf, length=None):
-        # Write a number of bytes to the provided address and taken from the
-        # provided buffer.  If no length is specified (the default) the entire
-        # buffer is written.
-        if length is None:
-            length = len(buf)
-        with self._device as device:
-            self._BUFFER[0] = (address | 0x80) & 0xFF  # Set top bit to 1 to
-                                                       # indicate a write.
-            device.write(self._BUFFER, end=1)
-            device.write(buf, end=length)
-
+    # TODO rename
     def _write_u8(self, register, payload):
-        # Write a byte register to the chip.  Specify the 7-bit address and the
-        # 8-bit value to write to that address.
         if type(payload) == int:
             payload = [payload]
         elif type(payload) == bytes:
@@ -699,15 +686,15 @@ class RFM9x:
         self.idle()  # Stop receiving to clear FIFO and keep it clear.
         # Fill the FIFO with a packet to send.
         self._write_u8(_RH_RF95_REG_0D_FIFO_ADDR_PTR, 0x00)  # FIFO starts at 0.
-        # Write header bytes.
-        self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[0]) # Header: To
-        self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[1]) # Header: From
-        self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[2]) # Header: Id
-        self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[3]) # Header: Flags
+        payload = struct.pack("BBBB", tx_header[0], tx_header[1], tx_header[2], tx_header[3]) + data
+        #self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[0]) # Header: To
+        #self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[1]) # Header: From
+        #self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[2]) # Header: Id
+        #self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[3]) # Header: Flags
         # Write payload.
-        self._write_from(_RH_RF95_REG_00_FIFO, data)
+        self._write_u8(_RH_RF95_REG_00_FIFO, payload)
         # Write payload and header length.
-        self._write_u8(_RH_RF95_REG_22_PAYLOAD_LENGTH, len(data) + 4)
+        self._write_u8(_RH_RF95_REG_22_PAYLOAD_LENGTH, len(payload))
         # Turn on transmit mode to send out the packet.
         self.transmit()
         # Wait for tx done interrupt with explicit polling (not ideal but
@@ -744,14 +731,18 @@ class RFM9x:
                 header_from = packet[1]
                 header_id = packet[2]
                 header_flags = packet[3]
+                FLAGS_ACK = 0x80
 
                 # If filter is defined and this message does not match
-                if self.receive_filter_address is not None and header_to != self.receive_filter_address and header_to != _RH_BROADCAST_ADDRESS:
+                if self.receive_filter_address is not None and header_to != self.receive_filter_address:
                     self.listen()
                     return
 
-                # FIXME add Radiohead ACK support
                 print("Got packet from {} to {} id {} flags {} data: {}".format(header_from, header_to, header_id, header_flags, binascii.hexlify(packet[4:]) if header_flags != 128 else packet[4:].decode("utf-8")))
+
+                if self.acks and not header_flags & FLAGS_ACK:
+                    self.send(b'!', tx_header=[header_from, self.receive_filter_address, header_id, FLAGS_ACK])
+
                 packet = packet[4:]
 
             self.listen()
