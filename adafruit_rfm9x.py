@@ -412,6 +412,8 @@ class RFM9x:
         self.receive_filter_address = _RH_BROADCAST_ADDRESS
         self.acks = False
         self.debug = False
+        self.last_sent_id = {}
+        self.last_received_id = {}
 
     def _handle_interrupt(self, gpio, level=0, tick=0):
         if self.tx_done:
@@ -689,11 +691,22 @@ class RFM9x:
         # pylint: disable=len-as-condition
         assert 0 < len(data) <= 252
         assert len(tx_header) == 4, "tx header must be 4-tuple (To,From,ID,Flags)"
+        # ID is not set
+        if (tx_header[2] == 0):
+            if tx_header[0] in self.last_sent_id:
+                tx_header[2] = self.last_sent_id[tx_header[0]] + 1
+            else:
+                tx_header[2] = 1
+
+            # Roll over at 254
+            tx_header[2] = tx_header[2] if tx_header[2] < 254 else 1
+            self.last_sent_id[tx_header[0]] = tx_header[2]
+
         # pylint: enable=len-as-condition
         self.idle()  # Stop receiving to clear FIFO and keep it clear.
         # Fill the FIFO with a packet to send.
         self._write_u8(_RH_RF95_REG_0D_FIFO_ADDR_PTR, 0x00)  # FIFO starts at 0.
-        payload = struct.pack("BBBB", tx_header[0], tx_header[1], tx_header[2], tx_header[3]) + data
+        payload = struct.pack("<BBBB", tx_header[0], tx_header[1], tx_header[2], tx_header[3]) + data
         #self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[0]) # Header: To
         #self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[1]) # Header: From
         #self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[2]) # Header: Id
@@ -752,7 +765,19 @@ class RFM9x:
                 if self.acks and not header_flags & FLAGS_ACK:
                     self.send(b'!', tx_header=[header_from, self.receive_filter_address, header_id, FLAGS_ACK])
 
+                if header_from in self.last_received_id and self.last_received_id[header_from] == header_id:
+                    if self.debug:
+                        print('Duplicate packet, droping')
+                    self.listen()
+                    return
+                self.last_received_id[header_from] = header_id
+
                 packet = packet[4:]
+
+            # ACK
+            if with_header and len(packet) == 1 and packet[0] == 0x21:
+                self.listen()
+                return
 
             self.listen()
             return namedtuple('Packet', ['data', 'rssi', 'snr'])(packet, rssi, snr)
