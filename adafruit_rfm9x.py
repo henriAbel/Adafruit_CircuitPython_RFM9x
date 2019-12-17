@@ -443,7 +443,11 @@ class RFM9x:
         # buffer.  If length is not specified (the default) the entire buffer
         # will be filled.
         packet = self._spi_read(address, len(buf) if length is None else length)
-        buf[0:] = packet
+        try:
+            # Invalid packet can cause TypeError when put into bytearray
+            buf[0:] = packet
+        except TypeError:
+            pass
 
     # TODO rename
     def _read_u8(self, address):
